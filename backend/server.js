@@ -33,6 +33,7 @@ const logger = require('./utils/logger');
 const { scheduleNotReturnedAlert } = require('./jobs/notReturnedAlert');
 const { scheduleQrCleanup } = require('./jobs/qrCleanup');
 const { scheduleArchiveJob } = require('./jobs/archiveScheduler');
+const { scheduleAttendanceExpiration } = require('./jobs/attendanceExpiration');
 const { startWhatsAppWorker, hasQueueInfra } = require('./queues/whatsappQueue');
 const { startArchiveWorker } = require('./queues/archiveQueue');
 const { initScanQueue } = require('./queues/scanQueue');
@@ -61,6 +62,9 @@ const attendanceRoutes = require('./routes/attendance');
 const allocationRoutes = require('./routes/allocations');
 const visitorRoutes   = require('./routes/visitors');
 const roomRoutes      = require('./routes/rooms');
+const parentRoutes    = require('./routes/parent');
+const adminGuardianRoutes = require('./routes/adminGuardians');
+const { scheduleParentApprovalJob } = require('./jobs/parentApprovalScheduler');
 
 // ── App & HTTP server (shared with Socket.IO) ─────────────────────────────────
 const app = express();
@@ -280,6 +284,8 @@ app.use('/api/attendance', attendanceRoutes);
 app.use('/api/allocations', allocationRoutes);
 app.use('/api/visitors',   visitorRoutes);
 app.use('/api/rooms',      roomRoutes);
+app.use('/api/parent',     parentRoutes);
+app.use('/api/admin/guardians', adminGuardianRoutes);
 
 // ── Health & Readiness Checks ─────────────────────────────────────────────────
 const handleHealth = (req, res) => {
@@ -288,7 +294,7 @@ const handleHealth = (req, res) => {
     status: 'ok',
     requestId: req.requestId,
     timestamp: new Date().toISOString(),
-    version: '2.0.0',
+    version: '2.1.0',
     service: 'HEIMDALL Smart Campus API',
     uptime: process.uptime(),
   });
@@ -375,7 +381,19 @@ app.use((err, req, res, next) => {
   });
 });
 
-// ── Start server ──────────────────────────────────────────────────────────────
+// ── Server Error & Startup ────────────────────────────────────────────────────
+server.on('error', (err) => {
+  if (err.code === 'EADDRINUSE') {
+    logger.error(`[Server] Fatal: Port ${PORT} is already in use by another process.`, {
+      port: PORT,
+      solution: `Kill the process on port ${PORT} or change PORT in backend/.env`,
+    });
+  } else {
+    logger.error('[Server] Fatal HTTP server error', { error: err.message, code: err.code });
+  }
+  process.exit(1);
+});
+
 server.listen(PORT, async () => {
   logger.info('🚀 HEIMDALL Smart Campus Hostel Management Platform v2.0');
   logger.info(`   Environment: ${process.env.NODE_ENV}`);
@@ -396,6 +414,8 @@ server.listen(PORT, async () => {
   scheduleNotReturnedAlert();
   scheduleQrCleanup();
   scheduleArchiveJob();
+  scheduleParentApprovalJob();
+  scheduleAttendanceExpiration();
   startWhatsAppWorker();
   startArchiveWorker();
 

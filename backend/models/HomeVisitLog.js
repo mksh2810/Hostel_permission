@@ -126,8 +126,101 @@ const homeVisitLogSchema = new mongoose.Schema(
     // ── Overall status ────────────────────────────────────────────────────────
     overall_status: {
       type: String,
-      enum: ['pending', 'parent_approved', 'approved', 'rejected', 'completed'],
+      enum: ['pending', 'parent_approved', 'approved', 'rejected', 'completed', 'parent_no_response'],
       default: 'pending',
+    },
+
+    // ── Digital Parent Approval Workflow ──────────────────────────────────────
+    parent_approval_status: {
+      type: String,
+      enum: ['legacy', 'pending', 'parent_approved', 'parent_rejected', 'parent_no_response'],
+      default: 'pending',
+      index: true,
+    },
+    parent_email: {
+      type: String,
+      default: null,
+      lowercase: true,
+      trim: true,
+    },
+    parent_name: {
+      type: String,
+      default: '',
+      trim: true,
+    },
+    departure_time: {
+      type: String,
+      default: '09:00 AM',
+      trim: true,
+    },
+    return_time: {
+      type: String,
+      default: '08:00 PM',
+      trim: true,
+    },
+    parent_token_hash: {
+      type: String,
+      default: null,
+      index: true,
+      sparse: true,
+    },
+    parent_token_expires_at: {
+      type: Date,
+      default: null,
+      index: true,
+    },
+    parent_decision_at: {
+      type: Date,
+      default: null,
+    },
+    parent_decision_ip: {
+      type: String,
+      default: null,
+    },
+    parent_decision_remarks: {
+      type: String,
+      default: '',
+      trim: true,
+    },
+    final_parent_decision_at: {
+      type: Date,
+      default: null,
+    },
+    parent_reminder_sent: {
+      type: Boolean,
+      default: false,
+    },
+    parent_decision_source: {
+      type: String,
+      enum: ['PARENT_PORTAL', 'PARENT_EMAIL_LINK', 'STAFF_PHONE_OVERRIDE', null],
+      default: null,
+    },
+    accompanying: {
+      type: String,
+      default: '',
+      trim: true,
+    },
+
+    // ── Email Notification Status via Google Apps Script / Free Tier ──────────
+    email_notification_status: {
+      type: String,
+      enum: ['PENDING', 'SUBMITTED', 'FAILED'],
+      default: 'PENDING',
+      index: true,
+    },
+    email_sent_at: {
+      type: Date,
+      default: null,
+    },
+    email_failure_reason: {
+      type: String,
+      default: null,
+    },
+    email_idempotency_key: {
+      type: String,
+      default: null,
+      index: true,
+      sparse: true,
     },
   },
   {

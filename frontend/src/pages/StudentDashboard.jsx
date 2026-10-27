@@ -38,11 +38,41 @@ import StudentAvatar from '../components/StudentAvatar';
 import StudentAttendancePrompt from '../components/StudentAttendancePrompt';
 import StudentAttendanceHistoryModal from '../components/StudentAttendanceHistoryModal';
 import StudentRoomInfoModal from '../components/StudentRoomInfoModal';
+import StudentGuardianPrompt from '../components/StudentGuardianPrompt';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 const BOT = 'bot';
 const USER = 'user';
 const CHAT_STORAGE_PREFIX = 'student-dashboard-chat:';
+const SEEN_SCAN_EVENTS_KEY = 'heimdall_seen_scan_events';
+
+function getSeenScanEvents() {
+  try {
+    const raw = sessionStorage.getItem(SEEN_SCAN_EVENTS_KEY);
+    return raw ? JSON.parse(raw) : {};
+  } catch {
+    return {};
+  }
+}
+
+function markScanEventSeen(eventKey) {
+  if (!eventKey) return;
+  try {
+    const seen = getSeenScanEvents();
+    seen[eventKey] = Date.now();
+    sessionStorage.setItem(SEEN_SCAN_EVENTS_KEY, JSON.stringify(seen));
+  } catch {}
+}
+
+function isScanEventSeen(eventKey) {
+  if (!eventKey) return false;
+  try {
+    const seen = getSeenScanEvents();
+    return Boolean(seen[eventKey]);
+  } catch {
+    return false;
+  }
+}
 
 // ── Live Gate Pass Anti-Screenshot Clock ─────────────────────────────────────
 function LiveGatePassClock() {
@@ -121,6 +151,7 @@ const STEPS = {
   HV_PLACE:      'HV_PLACE',
   HV_LEAVE:      'HV_LEAVE',
   HV_RETURN:     'HV_RETURN',
+  HV_PARENT_EMAIL: 'HV_PARENT_EMAIL',
   // Complaint
   CPL_TYPE:      'CPL_TYPE',
   CPL_PHOTO:     'CPL_PHOTO',
@@ -528,6 +559,9 @@ export default function StudentDashboard() {
   const [input, setInput]       = useState('');
   const [loading, setLoading]   = useState(false);
   const [hvData, setHvData]     = useState({});
+  const [parentEmailOnRecord, setParentEmailOnRecord] = useState('');
+  const [registeredGuardians, setRegisteredGuardians] = useState([]);
+  const lastAttemptedHvDataRef = useRef(null);
   const [zoomedQR, setZoomedQR] = useState(null);
   const [activePasses, setActivePasses] = useState([]);
   const [qrQuickLoading, setQrQuickLoading] = useState(false);
@@ -996,6 +1030,151 @@ export default function StudentDashboard() {
       return;
     }
 
+    if (id.startsWith('cancel_and_create_')) {
+      const visitId = id.replace('cancel_and_create_', '');
+      setLoading(true);
+      try {
+        const savedAttempt = lastAttemptedHvDataRef.current || hvData;
+
+        // 1. Cancel all active unscanned visits via dedicated endpoint
+        await api.post('/student/home-visit/cancel-active').catch(() => {});
+
+        // 2. Also attempt explicit ID cancellation if valid ID provided
+        if (visitId && visitId !== 'active') {
+          await api.post(`/student/home-visit/${visitId}/cancel`).catch(() => {});
+        }
+
+        // 3. Status sweep fallback: cancel any unscanned pending or approved visits
+        try {
+          const stRes = await api.get('/student/status');
+          const allVisits = [
+            ...(stRes.data?.status?.pendingVisits || []),
+            ...(stRes.data?.status?.approvedVisits || []),
+          ];
+          for (const v of allVisits) {
+            if (v._id && !v.qr_used_out) {
+              await api.post(`/student/home-visit/${v._id}/cancel`).catch(() => {});
+            }
+          }
+        } catch (_) {}
+
+        if (savedAttempt && savedAttempt.leave_date && savedAttempt.return_date) {
+          await submitHomeVisit({ ...savedAttempt, cancel_previous: true });
+        } else {
+          botSay('✅ Previous request cancelled. Let\'s create your new home visit pass:');
+          restartHomeVisitFlow();
+        }
+      } catch (err) {
+        botSay(`❌ Failed to replace request: ${err.response?.data?.message || err.message}`, 'buttons', {
+          buttons: FLOW_RECOVERY_BUTTONS,
+        });
+      } finally {
+        setLoading(false);
+      }
+      return;
+    }
+
+    if (id.startsWith('cancel_hv_')) {
+      const visitId = id.replace('cancel_hv_', '');
+      setLoading(true);
+      try {
+        const res = await api.post(`/student/home-visit/${visitId}/cancel`);
+        const savedAttempt = lastAttemptedHvDataRef.current;
+        const retryButtons = [];
+
+        if (savedAttempt && savedAttempt.leave_date && savedAttempt.return_date) {
+          retryButtons.push({
+            id: 'retry_last_hv_submit',
+            label: `🚀 Create Pass (${savedAttempt.leave_date} → ${savedAttempt.return_date})`,
+          });
+        }
+        retryButtons.push({ id: '2', label: '🏠 Apply for Home Visit' });
+        retryButtons.push({ id: 'flow_menu', label: '🏠 Main menu' });
+
+        botSay(
+          `✅ *Previous Request Cancelled*\n\n` +
+          `${res.data?.message || 'Your previous home visit request has been cancelled.'}\n\n` +
+          (savedAttempt && savedAttempt.leave_date
+            ? `Tap below to create your new pass for *${savedAttempt.leave_date} → ${savedAttempt.return_date}*:`
+            : `You may now submit a new home visit request.`),
+          'buttons',
+          { buttons: retryButtons }
+        );
+      } catch (err) {
+        botSay(`❌ Failed to cancel request: ${err.response?.data?.message || err.message}`, 'buttons', {
+          buttons: FLOW_RECOVERY_BUTTONS,
+        });
+      } finally {
+        setLoading(false);
+      }
+      return;
+    }
+
+    if (id === 'retry_last_hv_submit') {
+      if (lastAttemptedHvDataRef.current) {
+        await submitHomeVisit({ ...lastAttemptedHvDataRef.current, cancel_previous: true });
+      } else {
+        restartHomeVisitFlow();
+      }
+      return;
+    }
+
+    if (id.startsWith('resend_hv_')) {
+      const visitId = id.replace('resend_hv_', '');
+      setLoading(true);
+      try {
+        const res = await api.post(`/student/home-visit/${visitId}/resend-email`);
+        botSay(
+          `✉️ *Approval Email Resent*\n\n${res.data?.message || 'A fresh approval email has been sent to your parent.'}`,
+          'buttons',
+          {
+            buttons: [
+              { id: '4', label: '📊 View My Status' },
+              { id: 'flow_menu', label: '🏠 Main menu' },
+            ],
+          }
+        );
+      } catch (err) {
+        const errMsg = err.response?.data?.message || err.message;
+        if (errMsg && (errMsg.includes('No registered parent email') || errMsg.includes('parent email address'))) {
+          const newEmail = window.prompt('Enter parent/guardian email address to send approval link to:');
+          if (newEmail && newEmail.trim()) {
+            try {
+              const res2 = await api.post(`/student/home-visit/${visitId}/resend-email`, { parent_email: newEmail.trim() });
+              setParentEmailOnRecord(newEmail.trim());
+              botSay(
+                `✉️ *Approval Email Sent*\n\n${res2.data?.message || 'A fresh approval email has been sent to your parent.'}`,
+                'buttons',
+                {
+                  buttons: [
+                    { id: '4', label: '📊 View My Status' },
+                    { id: 'flow_menu', label: '🏠 Main menu' },
+                  ],
+                }
+              );
+              return;
+            } catch (err2) {
+              botSay(`❌ Failed to resend email: ${err2.response?.data?.message || err2.message}`, 'buttons', {
+                buttons: FLOW_RECOVERY_BUTTONS,
+              });
+              return;
+            }
+          }
+        }
+        botSay(`❌ Failed to resend email: ${errMsg}`, 'buttons', {
+          buttons: FLOW_RECOVERY_BUTTONS,
+        });
+      } finally {
+        setLoading(false);
+      }
+      return;
+    }
+
+    if (id === 'attendance_records' || id === 'flow_attendance') {
+      setAttendanceHistoryOpen(true);
+      return;
+    }
+
     if (id.startsWith('qr_')) {
       const entry = hvData?.[id];
       const payload =
@@ -1022,7 +1201,7 @@ export default function StudentDashboard() {
         });
       } else if (id === '2') {
         setStep(STEPS.HV_REASON);
-        botSay('🏠 *Home Visit Request*\n\nStep 1 — Please select a reason below, or type your own:', 'buttons', {
+        botSay('🏠 *Home Visit Request*\n\nStep 1/5 — Please select a reason below, or type your own:', 'buttons', {
           buttons: [
             { id: 'going_home', label: '🏠 Going Home' },
             { id: 'medical_reason', label: '🏥 Medical Reason' },
@@ -1097,7 +1276,35 @@ export default function StudentDashboard() {
       }
       setHvData({ reason: label });
       setStep(STEPS.HV_PLACE);
-      botSay('📍 Step 2/4 — Where is your destination place (e.g. Satara, Pune, Home Address)?');
+      botSay('📍 Step 2/5 — Where is your destination place (e.g. Satara, Pune, Home Address)?');
+    } else if (step === STEPS.HV_PARENT_EMAIL) {
+      if (id === 'use_guardian_0') {
+        const g0 = registeredGuardians[0];
+        const targetEmail = g0?.email || parentEmailOnRecord || user?.parentEmail;
+        const targetName = g0?.name || user?.parentName || '';
+        if (!targetEmail) {
+          botSay('⚠️ No registered parent email found. Please complete guardian registration.');
+          return;
+        }
+        await submitHomeVisit({ ...hvData, parent_email: targetEmail, parent_name: targetName });
+      } else if (id === 'use_guardian_1') {
+        const g1 = registeredGuardians[1];
+        if (!g1?.email) {
+          botSay('⚠️ Secondary registered parent email not found on file.');
+          return;
+        }
+        await submitHomeVisit({ ...hvData, parent_email: g1.email, parent_name: g1.name || '' });
+      } else if (id === 'use_registered_email') {
+        const targetEmail = parentEmailOnRecord || user?.parentEmail;
+        if (!targetEmail) {
+          botSay('⚠️ No registered parent email found on file.');
+          return;
+        }
+        await submitHomeVisit({ ...hvData, parent_email: targetEmail, parent_name: user?.parentName || '' });
+      } else if (id === 'prompt_guardian_setup') {
+        updateUser({ hasGuardians: false });
+        botSay('📝 The Parent & Guardian registration dialog is now displayed on your screen. Please submit your parent details to continue.');
+      }
     }
   };
 
@@ -1123,7 +1330,7 @@ export default function StudentDashboard() {
       }
       setHvData({ reason: text });
       setStep(STEPS.HV_PLACE);
-      botSay('📍 Step 2/4 — Where is your destination place (e.g. Satara ,Pune, Home Address)?');
+      botSay('📍 Step 2/5 — Where is your destination place (e.g. Satara, Pune, Home Address)?');
     } else if (step === STEPS.HV_PLACE) {
       setLoading(true);
       try {
@@ -1135,7 +1342,7 @@ export default function StudentDashboard() {
         }
         setHvData((d) => ({ ...d, place: text }));
         setStep(STEPS.HV_LEAVE);
-        botSay('📅 Step 3/4 — Please select your *date of leaving* using the calendar below:', 'date_picker', {
+        botSay('📅 Step 3/5 — Please select your *date of leaving* using the calendar below:', 'date_picker', {
           pickerStep: STEPS.HV_LEAVE,
         });
       } catch (err) {
@@ -1144,7 +1351,7 @@ export default function StudentDashboard() {
         } else {
           setHvData((d) => ({ ...d, place: text }));
           setStep(STEPS.HV_LEAVE);
-          botSay('📅 Step 3/4 — Please select your *date of leaving* using the calendar below:', 'date_picker', {
+          botSay('📅 Step 3/5 — Please select your *date of leaving* using the calendar below:', 'date_picker', {
             pickerStep: STEPS.HV_LEAVE,
           });
         }
@@ -1168,6 +1375,9 @@ export default function StudentDashboard() {
       }
     } else if (step === STEPS.HV_LEAVE || step === STEPS.HV_RETURN) {
       await processHomeVisitDate(text, step);
+    } else if (step === STEPS.HV_PARENT_EMAIL) {
+      botSay('⚠️ Arbitrary email entry is disabled for safety. Please tap one of your registered parent email buttons above to proceed.');
+      return;
     } else if (step === STEPS.CPL_PHOTO) {
       if (complaintPhoto) {
         await submitComplaintWithPhoto(complaintPhoto, text);
@@ -1201,7 +1411,7 @@ export default function StudentDashboard() {
         setAttendanceHistoryOpen(true);
       }
     } else if ([
-      STEPS.HV_REASON, STEPS.HV_PLACE, STEPS.HV_LEAVE, STEPS.HV_RETURN,
+      STEPS.HV_REASON, STEPS.HV_PLACE, STEPS.HV_LEAVE, STEPS.HV_RETURN, STEPS.HV_PARENT_EMAIL,
       STEPS.CPL_PHOTO, STEPS.CPL_TEXT, STEPS.INOUT_OTHER
     ].includes(step)) {
       botSay('You\'re in the middle of a request. Type *menu* for main menu, or use *Restart home visit* if dates are wrong.');
@@ -1301,6 +1511,7 @@ export default function StudentDashboard() {
 
   const submitHomeVisit = async (data) => {
     setLoading(true);
+    lastAttemptedHvDataRef.current = data;
     try {
       const statusRes = await api.get('/student/status');
       const activeVisits = [
@@ -1308,24 +1519,131 @@ export default function StudentDashboard() {
         ...(statusRes.data?.status?.approvedVisits || []),
       ];
 
-      const hasOverlap = activeVisits.some((visit) =>
-        visit.leave_date <= data.return_date && visit.return_date >= data.leave_date
-      );
-
-      if (hasOverlap) {
-        showFlowExitOptions(
-          '❌ You already have an active home visit pass for overlapping dates.\n\nUse *View My Status* for your current QR, or *Restart home visit* only if you have not submitted yet.'
+      if (!data.cancel_previous) {
+        const overlappingVisit = activeVisits.find((visit) =>
+          visit.leave_date <= data.return_date && visit.return_date >= data.leave_date
         );
-        return;
+
+        if (overlappingVisit) {
+          const canCancel = !overlappingVisit.qr_used_out;
+          const conflictDates = `${overlappingVisit.leave_date} → ${overlappingVisit.return_date}`;
+          const targetId = overlappingVisit._id || 'active';
+
+          const buttons = [];
+          if (canCancel) {
+            buttons.push({
+              id: `cancel_and_create_${targetId}`,
+              label: '⚡ Cancel Previous Request & Create New',
+            });
+          }
+          buttons.push({ id: 'flow_menu', label: '🏠 Main menu' });
+
+          botSay(
+            `⚠️ *Active Previous Request Exists*\n\n` +
+            `You already have an active home visit request for: *${conflictDates}*.\n\n` +
+            (canCancel
+              ? `Tap *Cancel Previous Request & Create New* below to immediately cancel your previous request and create your new pass for *${data.leave_date} → ${data.return_date}*.`
+              : `Since your previous pass has already been scanned out at the campus gate, it cannot be replaced.`),
+            'buttons',
+            { buttons }
+          );
+          setHvData({});
+          setStep(STEPS.MENU);
+          return;
+        }
       }
 
-      await api.post('/student/home-visit', data);
+      const res = await api.post('/student/home-visit', data);
+      const emails = res.data?.guardianEmails || (data.parent_email ? [data.parent_email] : []);
+      const emailSent = Boolean(res.data?.emailSent);
+      const emailFailureReason = res.data?.visit?.email_failure_reason;
+
+      if (data.parent_email) {
+        setParentEmailOnRecord(data.parent_email);
+      }
+
+      let emailNotice = '';
+      if (emails.length > 0 && emailSent) {
+        emailNotice = `📧 *Approval Request Emailed to Parent!*\n\nA secure digital approval link has been emailed to: *${emails.join(', ')}*.\n\nPlease ask your parent to open the link in their email inbox and tap *Approve*. Once approved, your digital QR gate pass will be automatically activated so you can leave the hostel.`;
+      } else if (emails.length > 0 && !emailSent) {
+        emailNotice = `⚠️ *Email Relay Status: Pending Delivery*\n\nYour request was recorded for parent email: *${emails.join(', ')}*.\nHowever, the email relay returned: *${emailFailureReason || 'Free relay pending setup'}*.\n\n💡 You can click *✉️ Resend Parent Email* from your status anytime, or have your hostel warden approve it manually.`;
+      } else {
+        emailNotice = `⚠️ *Notice: No Parent Email Registered*\n\nYour request has been logged. Please add your parent's email or contact your hostel warden for manual verification.`;
+      }
+
       botSay(
-        `✅ *Home Visit Request Submitted!*\n\n📝 Reason: ${data.reason}\n📍 Destination: ${data.place || 'Not specified'}\n📅 Leave: ${data.leave_date}\n📅 Return: ${data.return_date}\n\n⏳ The hostel staff will call your parent to confirm permission. Once confirmed, your QR gate pass will be generated.`
+        `✅ *Home Visit Request Submitted!*\n\n📝 Reason: ${data.reason}\n📍 Destination: ${data.place || 'Not specified'}\n📅 Leave: ${data.leave_date}\n📅 Return: ${data.return_date}\n\n${emailNotice}`
       );
       setHvData({});
       goToMainMenu();
     } catch (err) {
+      const errData = err.response?.data;
+      const isOverlap =
+        err.response?.status === 409 ||
+        Boolean(errData?.overlappingVisitId) ||
+        (errData?.message && errData.message.toLowerCase().includes('already exists'));
+
+      if (isOverlap) {
+        if (data.cancel_previous) {
+          botSay(
+            `⚠️ *Unable to Automatically Replace Previous Pass*\n\n` +
+            `${errData?.message || 'An active home visit request is still present in the system.'}\n\n` +
+            `Please tap below to check your status and cancel your previous pass manually:`,
+            'buttons',
+            {
+              buttons: [
+                { id: '4', label: '📊 View My Status & Cancel' },
+                { id: 'flow_menu', label: '🏠 Main menu' },
+              ],
+            }
+          );
+          setStep(STEPS.MENU);
+          return;
+        }
+
+        let overlappingId = errData?.overlappingVisitId;
+        const isScannedOut = Boolean(errData?.message?.toLowerCase().includes('already been scanned out'));
+        const canCancel = !isScannedOut && errData?.canCancel !== false;
+
+        if (!overlappingId) {
+          try {
+            const stRes = await api.get('/student/status');
+            const allVisits = [
+              ...(stRes.data?.status?.pendingVisits || []),
+              ...(stRes.data?.status?.approvedVisits || []),
+            ];
+            const found = allVisits.find((v) =>
+              v.leave_date <= data.return_date && v.return_date >= data.leave_date
+            ) || allVisits[0];
+            if (found) {
+              overlappingId = found._id;
+            }
+          } catch (_) {}
+        }
+
+        const targetId = overlappingId || 'active';
+        const buttons = [];
+        if (canCancel) {
+          buttons.push({
+            id: `cancel_and_create_${targetId}`,
+            label: '⚡ Cancel Previous Request & Create New',
+          });
+        }
+        buttons.push({ id: 'flow_menu', label: '🏠 Main menu' });
+
+        botSay(
+          `⚠️ *Active Previous Request Exists*\n\n` +
+          `${errData?.message || 'An active home visit already exists for overlapping dates.'}\n\n` +
+          (canCancel
+            ? `Tap *Cancel Previous Request & Create New* below to immediately cancel your previous request and create your new pass for *${data.leave_date} → ${data.return_date}*.`
+            : `Please complete or cancel your existing pass first before creating a new one.`),
+          'buttons',
+          { buttons }
+        );
+        setStep(STEPS.MENU);
+        return;
+      }
+
       showFlowExitOptions(`❌ ${err.response?.data?.message || 'Submission failed. Try again.'}`);
     } finally {
       setLoading(false);
@@ -1353,7 +1671,7 @@ export default function StudentDashboard() {
       setHvData((d) => ({ ...d, leave_date: leaveDate }));
       setStep(STEPS.HV_RETURN);
       botSay(
-        `📅 Step 4/4 — Select your *expected return date* below (after ${leaveDate}).`,
+        `📅 Step 4/5 — Select your *expected return date* below (after ${leaveDate}).`,
         'date_picker',
         { pickerStep: STEPS.HV_RETURN, leaveDate }
       );
@@ -1376,7 +1694,7 @@ export default function StudentDashboard() {
       if (!leaveDate) {
         botSay('❌ Leave date missing. Starting again from step 3.');
         setStep(STEPS.HV_LEAVE);
-        botSay('📅 Step 3/4 — Select your *date of leaving* below:', 'date_picker', {
+        botSay('📅 Step 3/5 — Select your *date of leaving* below:', 'date_picker', {
           pickerStep: STEPS.HV_LEAVE,
         });
         scrollChatToBottom();
@@ -1391,9 +1709,106 @@ export default function StudentDashboard() {
         botSay(`❌ Return date cannot exceed 3.5 months from leave date. Maximum: ${maxReturnDate}.`);
         return;
       }
-      await submitHomeVisit({ ...hvData, return_date: returnDate });
+      const updatedHv = { ...hvData, return_date: returnDate };
+      setHvData(updatedHv);
+      setStep(STEPS.HV_PARENT_EMAIL);
+
+      let currentGuardians = registeredGuardians;
+      if (!currentGuardians || currentGuardians.length === 0) {
+        try {
+          const stRes = await api.get('/student/status');
+          if (Array.isArray(stRes.data?.status?.guardians) && stRes.data.status.guardians.length > 0) {
+            currentGuardians = stRes.data.status.guardians;
+            setRegisteredGuardians(currentGuardians);
+          }
+        } catch (_) {}
+      }
+
+      if (currentGuardians && currentGuardians.length >= 2) {
+        const g0 = currentGuardians[0];
+        const g1 = currentGuardians[1];
+        botSay(
+          `📧 Step 5/5 — *Select Registered Parent for Approval*\n\n` +
+          `Your home visit pass requires verified digital approval from your registered parent or guardian.\n\n` +
+          `Please click one of your registered parent emails below to send the approval request:\n\n` +
+          `1️⃣ *${g0.name || 'Guardian 1'}* (${g0.relationship || 'Parent'}):\n` +
+          `   📬 \`${g0.email}\`\n\n` +
+          `2️⃣ *${g1.name || 'Guardian 2'}* (${g1.relationship || 'Parent'}):\n` +
+          `   📬 \`${g1.email}\`\n\n` +
+          `Tap a registered email below to send the approval link:`,
+          'buttons',
+          {
+            buttons: [
+              {
+                id: 'use_guardian_0',
+                label: `👨‍👩‍👦 ${g0.relationship || 'Parent 1'}: ${g0.email}`,
+              },
+              {
+                id: 'use_guardian_1',
+                label: `👨‍👩‍👦 ${g1.relationship || 'Parent 2'}: ${g1.email}`,
+              },
+              { id: 'flow_menu', label: '🏠 Main menu' },
+            ],
+          }
+        );
+      } else if (currentGuardians && currentGuardians.length === 1) {
+        const g0 = currentGuardians[0];
+        botSay(
+          `📧 Step 5/5 — *Registered Parent Approval*\n\n` +
+          `Your home visit pass requires verified digital approval from your registered parent or guardian.\n\n` +
+          `Registered parent on file:\n` +
+          `📬 *${g0.name ? `${g0.name} (${g0.relationship || 'Parent'}) — ` : ''}${g0.email}*\n\n` +
+          `Tap below to send the approval link to this registered parent email:`,
+          'buttons',
+          {
+            buttons: [
+              {
+                id: 'use_guardian_0',
+                label: `✅ Send to ${g0.email}`,
+              },
+              { id: 'flow_menu', label: '🏠 Main menu' },
+            ],
+          }
+        );
+      } else {
+        const fallbackEmail = parentEmailOnRecord || user?.parentEmail || '';
+        if (fallbackEmail) {
+          botSay(
+            `📧 Step 5/5 — *Registered Parent Approval*\n\n` +
+            `Your home visit pass requires verified digital approval from your registered parent.\n\n` +
+            `Registered parent email on file:\n` +
+            `📬 *${fallbackEmail}*\n\n` +
+            `Tap below to send the approval link:`,
+            'buttons',
+            {
+              buttons: [
+                {
+                  id: 'use_registered_email',
+                  label: `✅ Send to ${fallbackEmail}`,
+                },
+                { id: 'flow_menu', label: '🏠 Main menu' },
+              ],
+            }
+          );
+        } else {
+          botSay(
+            `⚠️ *No Registered Parent Email Found*\n\n` +
+            `You do not have a registered parent or guardian email on file.\n\n` +
+            `Please register your parent and guardian details first before applying for a home visit.`,
+            'buttons',
+            {
+              buttons: [
+                { id: 'prompt_guardian_setup', label: '📝 Complete Guardian Details' },
+                { id: 'flow_menu', label: '🏠 Main menu' },
+              ],
+            }
+          );
+        }
+      }
+      scrollChatToBottom();
+      return;
     }
-  }, [loading, hvData, botSay, userSay, scrollChatToBottom, submitHomeVisit]);
+  }, [loading, hvData, parentEmailOnRecord, registeredGuardians, user, botSay, userSay, scrollChatToBottom, submitHomeVisit]);
 
   const handleComplaintPhotoChange = async (e) => {
     const file = e.target.files?.[0];
@@ -1575,6 +1990,12 @@ export default function StudentDashboard() {
       if (s.studentPhoto && !user?.studentPhoto) {
         updateUser({ studentPhoto: s.studentPhoto, picture: s.studentPhoto });
       }
+      if (s.parentEmail) {
+        setParentEmailOnRecord(s.parentEmail);
+      }
+      if (Array.isArray(s.guardians) && s.guardians.length > 0) {
+        setRegisteredGuardians(s.guardians);
+      }
 
       const passes = parseActivePasses(s);
       setActivePasses(passes);
@@ -1636,29 +2057,48 @@ export default function StudentDashboard() {
         } else if (isHvDeparture) {
           isHomeVisit = true;
           isHvPhaseReturn = false;
-        } else if (!logChanged && (latestApprovedHv?.qr_used_out || latestRecentHv?.qr_used_in)) {
-          if (latestRecentHv?.qr_used_in) {
-            isHomeVisit = true;
-            isHvPhaseReturn = true;
-          } else if (latestApprovedHv?.qr_used_out) {
-            isHomeVisit = true;
-            isHvPhaseReturn = false;
-          }
         } else if (logChanged) {
           isHomeVisit = false;
         } else {
-          // Compare event timestamps to see what is newest
-          const hvReturnTime = new Date(latestRecentHv?.actual_in_time || latestRecentHv?.actual_in || 0).getTime();
-          const hvOutTime = new Date(latestApprovedHv?.actual_out_time || latestApprovedHv?.actual_out || 0).getTime();
-          const logTime = new Date(latestLog?.in_time || latestLog?.out_time || latestLog?.timestamp || 0).getTime();
+          // No actual pass scan state changed — skip unprovoked alert
+          return;
+        }
 
-          const maxHvTime = Math.max(hvReturnTime, hvOutTime);
-          if (maxHvTime > logTime) {
-            isHomeVisit = true;
-            isHvPhaseReturn = hvReturnTime >= hvOutTime;
-          } else {
-            isHomeVisit = false;
-          }
+        // ── STRICT RECENCY & SEEN CHECK (prevents old historical scans from popping up) ──
+        const hvRecord = isHomeVisit
+          ? (isHvPhaseReturn ? (latestRecentHv || latestApprovedHv) : latestApprovedHv)
+          : null;
+        const rawTime = isHomeVisit
+          ? (isHvPhaseReturn
+              ? (hvRecord?.actual_in_time || hvRecord?.actual_in)
+              : (hvRecord?.actual_out_time || hvRecord?.actual_out))
+          : (latestLog?.status === 'OUT'
+              ? (latestLog?.out_time || latestLog?.timestamp)
+              : (latestLog?.in_time || latestLog?.timestamp));
+
+        if (!rawTime) {
+          return;
+        }
+
+        const eventTimestamp = new Date(rawTime).getTime();
+        const eventAgeMs = Date.now() - eventTimestamp;
+        const MAX_ALERT_AGE_MS = 120 * 1000; // 2 minutes window for live gate alerts
+
+        // If the event happened more than 2 minutes ago or is invalid, treat as historical and skip modal
+        if (isNaN(eventTimestamp) || eventAgeMs > MAX_ALERT_AGE_MS || eventAgeMs < -60000) {
+          return;
+        }
+
+        const scanType = isHomeVisit
+          ? (isHvPhaseReturn ? 'HOME_IN' : 'HOME_OUT')
+          : (latestLog?.status === 'OUT' ? 'OUT' : 'IN');
+
+        const eventKey = isHomeVisit
+          ? `hv_${hvRecord?._id}_${scanType}_${eventTimestamp}`
+          : `log_${latestLog?._id}_${scanType}_${eventTimestamp}`;
+
+        if (isScanEventSeen(eventKey)) {
+          return;
         }
 
         // If an instant socket/SSE scan popup was already shown in the last 6 seconds, do not duplicate
@@ -1666,6 +2106,7 @@ export default function StudentDashboard() {
           return;
         }
         lastPopupShownAtRef.current = Date.now();
+        markScanEventSeen(eventKey);
 
         // Close zoomed QR so full screen modal takes over cleanly
         setZoomedQR(null);
@@ -1681,8 +2122,6 @@ export default function StudentDashboard() {
         }
 
         if (isHomeVisit) {
-          const hvRecord = isHvPhaseReturn ? (latestRecentHv || latestApprovedHv) : latestApprovedHv;
-          const scanType = isHvPhaseReturn ? 'HOME_IN' : 'HOME_OUT';
           const title = isHvPhaseReturn ? 'Home Visit Return Verified' : 'Home Visit Departure Verified';
           const subtitle = isHvPhaseReturn
             ? 'Security scanned your Home Visit return pass. Welcome back to campus hostel!'
@@ -1690,12 +2129,10 @@ export default function StudentDashboard() {
           const destination = hvRecord?.place || 'Home';
           const leaveDate = hvRecord?.leave_date ? format(new Date(hvRecord.leave_date), 'dd MMM yyyy') : '';
           const returnDate = hvRecord?.return_date ? format(new Date(hvRecord.return_date), 'dd MMM yyyy') : '';
-          const rawTime = isHvPhaseReturn
-            ? (hvRecord?.actual_in_time || hvRecord?.actual_in || new Date())
-            : (hvRecord?.actual_out_time || hvRecord?.actual_out || new Date());
           const scanTime = new Date(rawTime).toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit' });
 
           setScanAlertModal({
+            eventKey,
             isHomeVisit: true,
             homeVisitPhase: isHvPhaseReturn ? 'return' : 'departure',
             scanType,
@@ -1764,6 +2201,7 @@ export default function StudentDashboard() {
           }
 
           setScanAlertModal({
+            eventKey,
             isHomeVisit: false,
             scanType,
             title,
@@ -1800,14 +2238,20 @@ export default function StudentDashboard() {
 
     const logStatus = String(eventData.log?.status || '').toUpperCase();
     const rawTimestamp = eventData.log?.timestamp || eventData.timestamp || new Date();
-    const eventKey = `${logStatus}_${new Date(rawTimestamp).getTime() || Date.now()}`;
+    const eventTimeMs = new Date(rawTimestamp).getTime() || Date.now();
+    const eventKey = `${logStatus}_${eventTimeMs}_${eventData.log?._id || eventData.pass_id || ''}`;
 
-    // Deduplicate rapid dual events from WebSocket + SSE
-    if (lastProcessedEventKeyRef.current === eventKey || Date.now() - lastPopupShownAtRef.current < 3500) {
+    // Deduplicate rapid dual events from WebSocket + SSE or already seen
+    if (
+      isScanEventSeen(eventKey) ||
+      lastProcessedEventKeyRef.current === eventKey ||
+      Date.now() - lastPopupShownAtRef.current < 3500
+    ) {
       return;
     }
     lastProcessedEventKeyRef.current = eventKey;
     lastPopupShownAtRef.current = Date.now();
+    markScanEventSeen(eventKey);
 
     const isHomeVisit = eventData.kind === 'home_visit' || logStatus.startsWith('HOME');
     const isHvPhaseReturn = logStatus === 'HOME IN' || logStatus === 'HOME_IN';
@@ -1831,6 +2275,7 @@ export default function StudentDashboard() {
         : 'Security scanned your Home Visit pass at the gate. Have a safe journey home!';
 
       setScanAlertModal({
+        eventKey,
         isHomeVisit: true,
         homeVisitPhase: isHvPhaseReturn ? 'return' : 'departure',
         scanType,
@@ -1871,6 +2316,7 @@ export default function StudentDashboard() {
         : 'Welcome back! Your campus entry has been successfully recorded.';
 
       setScanAlertModal({
+        eventKey,
         isHomeVisit: false,
         scanType,
         title,
@@ -2107,6 +2553,12 @@ export default function StudentDashboard() {
     try {
       const res = await api.get('/student/status');
       const s = res.data.status;
+      if (s?.parentEmail) {
+        setParentEmailOnRecord(s.parentEmail);
+      }
+      if (Array.isArray(s?.guardians) && s.guardians.length > 0) {
+        setRegisteredGuardians(s.guardians);
+      }
       const passes = parseActivePasses(s);
       setActivePasses(passes);
 
@@ -2134,20 +2586,40 @@ export default function StudentDashboard() {
         statusMsg += `\n\nℹ️ *No active QR code generated.*\nTap *Generate QR Pass* below to create a 15-minute gate pass.`;
       }
 
+      const statusButtons = [];
+      const qrMap = {};
+
       if (s.pendingVisits?.length > 0) {
         statusMsg += `\n\n🏠 *Pending Home Visits:*`;
         s.pendingVisits.forEach((v, i) => {
-          statusMsg += `\n${i + 1}. ${v.leave_date} → ${v.return_date} (${v.overall_status})`;
+          let statusText = '⏳ Awaiting Parent Approval';
+          if (v.email_notification_status === 'FAILED') {
+            statusText = '⚠️ Email Failed — Resend Available';
+          } else if (v.parent_approval_status === 'parent_approved' && v.warden_status === 'pending') {
+            statusText = '✅ Parent Approved — Awaiting Warden';
+          } else if (v.parent_approval_status === 'parent_rejected') {
+            statusText = '❌ Parent Rejected';
+          }
+          statusMsg += `\n${i + 1}. ${v.leave_date} → ${v.return_date} — ${statusText}`;
+          if (v.parent_approval_status === 'pending' || v.email_notification_status === 'FAILED') {
+            statusButtons.push({
+              id: `resend_hv_${v._id}`,
+              label: `✉️ Resend Parent Email (${v.leave_date})`,
+            });
+          }
+          if (!v.qr_used_out) {
+            statusButtons.push({
+              id: `cancel_hv_${v._id}`,
+              label: `🗑️ Cancel Request (${v.leave_date})`,
+            });
+          }
         });
       }
-
-      const statusButtons = [];
-      const qrMap = {};
 
       if (s.approvedVisits?.length > 0) {
         statusMsg += `\n\n✅ *Active Home Visit Passes:*`;
         s.approvedVisits.forEach((v, i) => {
-          statusMsg += `\n${i + 1}. ${v.leave_date} → ${v.return_date} — scannable gate pass ready`;
+          statusMsg += `\n${i + 1}. ${v.leave_date} → ${v.return_date} — ✅ Parent Approved (Pass Ready)`;
           if (v.qrDataUrl) {
             const phase = v.qr_used_out ? 'return' : 'departure';
             statusButtons.push({
@@ -2164,6 +2636,12 @@ export default function StudentDashboard() {
               leaveDate: v.leave_date,
               returnDate: v.return_date,
             };
+          }
+          if (!v.qr_used_out) {
+            statusButtons.push({
+              id: `cancel_hv_${v._id}`,
+              label: `🗑️ Cancel Pass (${v.leave_date})`,
+            });
           }
         });
       }
@@ -2207,12 +2685,12 @@ export default function StudentDashboard() {
         setHvData(prev => ({ ...prev, ...qrMap }));
       }
 
-      if (statusButtons.length > 0) {
-        statusMsg += '\n\n📲 Tap a button below to open your home visit QR.';
-        botSay(statusMsg, 'buttons', { buttons: statusButtons });
-      } else {
-        botSay(statusMsg);
-      }
+      statusButtons.push({
+        id: 'attendance_records',
+        label: '📋 View Attendance Records',
+      });
+
+      botSay(statusMsg, 'buttons', { buttons: statusButtons });
 
       // Daily in/out only — home visit QR opens via button (prevents duplicate cards).
       if (s.pendingInOutRequest?.qrDataUrl) {
@@ -3089,6 +3567,10 @@ export default function StudentDashboard() {
 
       {/* ── Chat Area ── */}
       <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden', position: 'relative' }}>
+        <StudentGuardianPrompt
+          user={user}
+          onComplete={() => updateUser({ hasGuardians: true })}
+        />
         <StudentAttendancePrompt
           user={user}
           socket={activeSocket}
@@ -3237,7 +3719,7 @@ export default function StudentDashboard() {
               <button
                 type="button"
                 onClick={() => {
-                  if (!attendanceStatus?.isMarked && !attendanceStatus?.todayRecord?.status) {
+                  if (attendanceStatus?.hasPending) {
                     setAttendancePromptOpenTrigger((prev) => prev + 1);
                   } else {
                     setAttendanceHistoryOpen(true);
@@ -3506,17 +3988,19 @@ export default function StudentDashboard() {
                   padding: '8px 14px',
                   fontSize: 12.5,
                   borderRadius: 12,
-                  display: 'flex',
+                  display: 'inline-flex',
                   alignItems: 'center',
                   gap: 6,
                   cursor: 'pointer',
                   boxShadow: attendanceStatus?.hasPending ? '0 0 16px rgba(79, 70, 229, 0.6)' : 'none',
                   animation: attendanceStatus?.hasPending ? 'pulse 1.6s infinite' : 'none',
                   transition: 'all 0.18s ease',
+                  whiteSpace: 'nowrap',
+                  flexShrink: 0,
                 }}
                 title="Hostel Night Attendance Status — Tap to Verify or View Records"
               >
-                <span>
+                <span style={{ fontSize: 13, flexShrink: 0, display: 'inline-flex', alignItems: 'center' }}>
                   {attendanceStatus?.hasPending
                     ? '📍'
                     : attendanceStatus?.todayRecord?.status === 'present'
@@ -3527,16 +4011,16 @@ export default function StudentDashboard() {
                     ? '✈️'
                     : '📋'}
                 </span>
-                <span>
+                <span style={{ whiteSpace: 'nowrap' }}>
                   {attendanceStatus?.hasPending
                     ? `Mark Attendance (${attendanceStatus?.pendingRequest?.remainingSeconds || 60}s)`
                     : attendanceStatus?.todayRecord?.status === 'present'
-                    ? `✅ Present (${attendanceStatus?.todayRecord?.time || 'Today'})`
+                    ? `Present (${attendanceStatus?.todayRecord?.time || 'Today'})`
                     : attendanceStatus?.todayRecord?.status === 'absent'
-                    ? `❌ Absent (${attendanceStatus?.todayRecord?.time || 'Today'})`
+                    ? `Absent (${attendanceStatus?.todayRecord?.time || 'Today'})`
                     : attendanceStatus?.todayRecord?.status === 'on_leave'
-                    ? '✈️ On Approved Leave'
-                    : '📋 Not Marked Yet'}
+                    ? 'On Approved Leave'
+                    : 'Not Marked Yet'}
                 </span>
               </button>
 
@@ -4821,7 +5305,12 @@ export default function StudentDashboard() {
             {/* Acknowledge Button */}
             <button
               type="button"
-              onClick={() => setScanAlertModal(null)}
+              onClick={() => {
+                if (scanAlertModal?.eventKey) {
+                  markScanEventSeen(scanAlertModal.eventKey);
+                }
+                setScanAlertModal(null);
+              }}
               style={{
                 width: '100%',
                 padding: '14px 20px',

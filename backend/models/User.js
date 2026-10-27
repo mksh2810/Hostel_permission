@@ -58,12 +58,37 @@ const userSchema = new mongoose.Schema(
     // ── Role & Status ─────────────────────────────────────────────────────────
     role: {
       type: String,
-      enum: ['student', 'warden', 'hostel_staff', 'security', 'admin'],
+      enum: ['student', 'warden', 'hostel_staff', 'security', 'admin', 'parent'],
       default: 'student',
     },
     isActive: {
       type: Boolean,
       default: true,
+    },
+    // Password authentication (for parent portal and local student accounts)
+    passwordHash: {
+      type: String,
+      default: null,
+    },
+    isEmailVerified: {
+      type: Boolean,
+      default: true,
+    },
+    resetPasswordToken: {
+      type: String,
+      default: null,
+    },
+    resetPasswordExpires: {
+      type: Date,
+      default: null,
+    },
+    loginOtpHash: {
+      type: String,
+      default: null,
+    },
+    loginOtpExpires: {
+      type: Date,
+      default: null,
     },
 
     // ── Student-only Fields ───────────────────────────────────────────────────
@@ -100,6 +125,31 @@ const userSchema = new mongoose.Schema(
     },
     parentPhone2: {
       // Student's secondary / alternate parent contact number (E.164 format)
+      type: String,
+      default: null,
+    },
+    parentEmail: {
+      // Student's primary parent / guardian email address for approval notifications
+      type: String,
+      lowercase: true,
+      trim: true,
+      default: null,
+    },
+    parentName: {
+      // Student's parent / guardian full name
+      type: String,
+      trim: true,
+      default: null,
+    },
+    isOutsideCampus: {
+      type: Boolean,
+      default: false,
+    },
+    lastGateScanAt: {
+      type: Date,
+      default: null,
+    },
+    lastGateScanType: {
       type: String,
       default: null,
     },
